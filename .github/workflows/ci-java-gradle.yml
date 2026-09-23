@@ -82,8 +82,6 @@ jobs:
             | bash -s -- -v "$OPENGREP_VERSION" || true
           export PATH="$HOME/.opengrep/cli/latest:$PATH"
           opengrep scan --config auto --sarif -o sast.sarif . 2>/dev/null || true
-          COUNT=$(jq '[.runs[].results[]] | length' sast.sarif 2>/dev/null || echo 0)
-          echo "<html><body><h1>SAST (OpenGrep)</h1><p>Findings: ${COUNT}</p></body></html>" > sast-scan-report.html
 
       - name: CVE scan (Trivy)
         if: always()
@@ -91,58 +89,10 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          format: table
-          output: trivy.txt
+          format: json
+          output: trivy.json
           exit-code: '0'
           severity: CRITICAL,HIGH
-
-      - name: Render CVE report
-        if: always()
-        run: |
-          echo "<html><body><h1>CVE (Trivy)</h1><pre>$(cat trivy.txt 2>/dev/null | head -200 || echo 'no audit output')</pre></body></html>" > cve-scan.html
-
-      - name: Build evidence metrics
-        if: always()
-        run: |
-          UNIT_TOTAL=0 UNIT_PASSED=0 UNIT_FAILED=0
-          TEST_RESULTS_DIR="build/test-results/test"
-          if [ -d "$TEST_RESULTS_DIR" ]; then
-            UNIT_TOTAL=$( (grep -h -c '<testcase ' "$TEST_RESULTS_DIR"/TEST-*.xml 2>/dev/null || true) | awk '{s+=$1} END {print s+0}')
-            UNIT_FAILED=$( (grep -h -cE '<(failure|error) ' "$TEST_RESULTS_DIR"/TEST-*.xml 2>/dev/null || true) | awk '{s+=$1} END {print s+0}')
-            UNIT_PASSED=$((UNIT_TOTAL - UNIT_FAILED))
-          fi
-          COV_PCT=0
-          JACOCO_XML="build/reports/jacoco/test/jacocoTestReport.xml"
-          if [ -f "$JACOCO_XML" ]; then
-            RATE=$(grep -oP 'line-rate="\K[0-9.]+' "$JACOCO_XML" 2>/dev/null | head -1 || echo "")
-            [ -n "$RATE" ] && COV_PCT=$(python3 -c "print(int(float('$RATE')*100))" 2>/dev/null || echo 0)
-          fi
-          SAST_CRIT=0 SAST_HIGH=0
-          if [ -f sast.sarif ]; then
-            SAST_CRIT=$(jq '[.runs[].results[] | select(.level=="error")] | length' sast.sarif 2>/dev/null || echo 0)
-            SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="warning")] | length' sast.sarif 2>/dev/null || echo 0)
-          fi
-          CVE_CRIT=0 CVE_HIGH=0
-          if [ -f trivy.txt ]; then
-            CVE_CRIT=$(grep -c CRITICAL trivy.txt 2>/dev/null || true); CVE_CRIT=${CVE_CRIT:-0}
-            CVE_HIGH=$(grep -c HIGH trivy.txt 2>/dev/null || true); CVE_HIGH=${CVE_HIGH:-0}
-          fi
-          jq -n \
-            --argjson unit_total "${UNIT_TOTAL:-0}" \
-            --argjson unit_passed "${UNIT_PASSED:-0}" \
-            --argjson unit_failed "${UNIT_FAILED:-0}" \
-            --argjson cov_pct "${COV_PCT:-0}" \
-            --argjson sast_crit "${SAST_CRIT:-0}" \
-            --argjson sast_high "${SAST_HIGH:-0}" \
-            --argjson cve_crit "${CVE_CRIT:-0}" \
-            --argjson cve_high "${CVE_HIGH:-0}" \
-            '{
-              unit_tests: { total: $unit_total, passed: $unit_passed, failed: $unit_failed },
-              integration_tests: { total: 0, passed: 0, failed: 0 },
-              coverage: { line_percent: $cov_pct },
-              sast_scan: { vulnerabilities: { critical: $sast_crit, high: $sast_high, medium: 0 }, scanned_files: 0 },
-              security: { tool: "trivy", vulnerabilities: { critical: $cve_crit, high: $cve_high, medium: 0 } }
-            }' > sdlc-evidence.json
 
       - name: Upload reports artifact
         if: always()
@@ -150,72 +100,24 @@ jobs:
         with:
           name: test-reports-${{ github.sha }}
           path: |
-            sdlc-evidence.json
             unit-tests.html
             integration-tests.html
-            coverage/
-            sast-scan-report.html
-            cve-scan.html
+            sast.sarif
+            trivy.json
             build/test-results/
-            build/reports/tests/
+            build/reports/jacoco/
+            coverage/
           retention-days: 30
 
       - name: Upload evidence to LaneSync
+        uses: ./.github/actions/lanesync-upload
         if: always()
-        env:
-          SDLC_API_URL: ${{ vars.SDLC_API_URL || 'https://lanesync.dev' }}
-        run: |
-          REF="${GITHUB_REF#refs/heads/}"
-          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
-            ENVIRONMENT=production
-            VERSION="${GITHUB_REF#refs/tags/}"
-          elif [ "$REF" = "main" ]; then
-            ENVIRONMENT=dev
-            VERSION=dev
-          elif case "$REF" in release/*) true;; *) false;; esac; then
-            ENVIRONMENT=staging
-            VERSION="${REF#release/}"
-          else
-            echo "Not an evidence branch — skipping upload."
-            exit 0
-          fi
-
-          REPORT_JSON="[]"
-          TEST_RESULTS_DIR="build/test-results/test"
-          if [ -d "$TEST_RESULTS_DIR" ]; then
-            FIRST_XML=$(find "$TEST_RESULTS_DIR" -name 'TEST-*.xml' -print -quit 2>/dev/null || true)
-            if [ -n "$FIRST_XML" ] && [ -f "$FIRST_XML" ]; then
-              REPORT_JSON=$(jq -n --rawfile c "$FIRST_XML" --arg fn "$(basename "$FIRST_XML")" '[{filename:$fn,content:$c}]')
-            fi
-          fi
-
-          if [ -n "${{ secrets.LANESYNC_API_KEY }}" ]; then
-            AUTH_HEADER="Authorization: Bearer ${{ secrets.LANESYNC_API_KEY }}"
-          else
-            TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=lanesync" | jq -r .value)
-            AUTH_HEADER="Authorization: Bearer $TOKEN"
-          fi
-          PAYLOAD=$(jq -n \
-            --arg org "${{ github.repository_owner }}" \
-            --arg repo "${{ github.event.repository.name }}" \
-            --arg version "$VERSION" \
-            --arg environment "$ENVIRONMENT" \
-            --argjson metrics "$(cat sdlc-evidence.json)" \
-            --argjson test_report_files "$REPORT_JSON" \
-            --rawfile unit_html unit-tests.html \
-            --rawfile integration_html integration-tests.html \
-            --rawfile coverage_html coverage/index.html \
-            --rawfile sast_html sast-scan-report.html \
-            --rawfile cve_html cve-scan.html \
-            '{ org: $org, repo: $repo, version: $version, environment: $environment, pipeline: "CI — Build & Test", metrics: $metrics, test_report_files: $test_report_files,
-               reports: { unit_tests: $unit_html, integration_tests: $integration_html, coverage: $coverage_html, sast_scan: $sast_html, security: $cve_html } }')
-          if ! curl --silent --show-error --fail-with-body \
-            --connect-timeout 10 --max-time 30 \
-            -X POST "$SDLC_API_URL/api/evidence/upload" \
-            -H "Content-Type: application/json" -H "$AUTH_HEADER" -d "$PAYLOAD"; then
-            echo "Evidence upload failed (non-blocking)."
-          fi
+        with:
+          api-url: ${{ vars.SDLC_API_URL || 'https://lanesync.dev' }}
+          api-key: ${{ secrets.LANESYNC_API_KEY }}
+          dev-branch: "main"
+          release-prefix: "release/"
+          pipeline: "CI — Build & Test"
 
   tag:
     name: Auto-Tag on Push
