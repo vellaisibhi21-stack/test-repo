@@ -204,9 +204,23 @@ runs:
             sast.sarif > "$SARIF" 2>/dev/null || rm -f "$SARIF"
         fi
         if [ -f "$SARIF" ]; then
-          SAST_CRIT=$(int jq '[.runs[]?.results[]? | select(.level=="error")] | length' "$SARIF")
-          SAST_HIGH=$(int jq '[.runs[]?.results[]? | select(.level=="warning")] | length' "$SARIF")
-          SAST_MED=$(int jq '[.runs[]?.results[]? | select(.level=="note")] | length' "$SARIF")
+          # Same grading as LaneSync's SARIF parser: a rule's CVSS `security-severity` wins,
+          # else the result level (falling back to the rule default) maps
+          # error→high, warning→medium, note→low.
+          jq -r '
+            .runs[]? as $r
+            | ([$r.tool.driver.rules[]? | select(.id != null) | {key: .id, value: .}] | from_entries) as $rules
+            | $r.results[]?
+            | ($rules[.ruleId // ""] // {}) as $rule
+            | ($rule.properties["security-severity"] // null | if . == null then null else (tostring | tonumber? // null) end) as $score
+            | if $score != null then
+                (if $score >= 9 then "critical" elif $score >= 7 then "high" elif $score >= 4 then "medium" elif $score > 0 then "low" else "info" end)
+              else
+                ({"error": "high", "warning": "medium", "note": "low", "none": "info"}[.level // $rule.defaultConfiguration.level // "warning"] // "medium")
+              end' "$SARIF" > "$OUT/sast-severity.txt" 2>/dev/null || : > "$OUT/sast-severity.txt"
+          SAST_CRIT=$(count '^critical$' "$OUT/sast-severity.txt")
+          SAST_HIGH=$(count '^high$' "$OUT/sast-severity.txt")
+          SAST_MED=$(count '^medium$' "$OUT/sast-severity.txt")
         fi
 
         CVE_CRIT=0; CVE_HIGH=0; CVE_MED=0
@@ -219,29 +233,12 @@ runs:
           CVE_MED=$(int jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$OUT/trivy.json")
         fi
 
-        # ── HTML views for the current evidence UI ────────────────────────
-        if [ -f "$SARIF" ]; then
-          jq -r '
-            [.runs[]? as $r | $r.results[]? | {
-              level: (.level // "warning"),
-              rule: (.ruleId // ""),
-              msg: (.message.text // ""),
-              loc: ((.locations[0].physicalLocation.artifactLocation.uri // "") + ":" + ((.locations[0].physicalLocation.region.startLine // 0) | tostring))
-            }] as $f
-            | "<html><body><h1>SAST Scan (\($f | length) findings)</h1><table border=\"1\" cellpadding=\"4\">"
-              + "<tr><th>Level</th><th>Rule</th><th>Location</th><th>Message</th></tr>"
-              + ([$f[] | "<tr><td>\(.level | @html)</td><td>\(.rule | @html)</td><td>\(.loc | @html)</td><td>\(.msg | @html)</td></tr>"] | join(""))
-              + "</table></body></html>"' "$SARIF" > "$OUT/sast.html" 2>/dev/null || rm -f "$OUT/sast.html"
-        fi
-        if [ -f "$OUT/trivy.json" ]; then
-          jq -r '
-            [.Results[]? as $r | $r.Vulnerabilities[]? | . + {Target: $r.Target}] as $v
-            | "<html><body><h1>CVE Scan (\($v | length) vulnerabilities)</h1><table border=\"1\" cellpadding=\"4\">"
-              + "<tr><th>Severity</th><th>CVE</th><th>Package</th><th>Installed</th><th>Fixed</th><th>Target</th></tr>"
-              + ([$v[] | "<tr><td>\(.Severity // "" | @html)</td><td>\(.VulnerabilityID // "" | @html)</td><td>\(.PkgName // "" | @html)</td><td>\(.InstalledVersion // "" | @html)</td><td>\(.FixedVersion // "" | @html)</td><td>\(.Target // "" | @html)</td></tr>"] | join(""))
-              + "</table></body></html>"' "$OUT/trivy.json" > "$OUT/cve.html" 2>/dev/null || rm -f "$OUT/cve.html"
-        fi
-
+        # ── HTML views ────────────────────────────────────────────────────
+        # LaneSync renders the unit-test, coverage, SAST and CVE views from the raw reports
+        # below. unit-tests.html is sent only as a fallback for runners LaneSync cannot parse.
+        # integration-tests.html is not sent: its numbers are not collected yet, and a
+        # placeholder page must not read as a passing suite. coverage/index.html is never
+        # sent because tool-generated coverage HTML embeds source files.
         echo '{}' > "$OUT/reports.json"
         add_report() { # <key> <path>
           if fits "$2"; then
@@ -250,11 +247,6 @@ runs:
           fi
         }
         add_report unit_tests unit-tests.html
-        add_report integration_tests integration-tests.html
-        # coverage/index.html is not sent: tool-generated coverage HTML embeds source files.
-        # LaneSync renders the coverage view from the parsed coverage report instead.
-        add_report sast_scan "$OUT/sast.html"
-        add_report security "$OUT/cve.html"
 
         # ── Raw report lists (built from files — never via argv) ──────────
         for list in tests coverage sast cve; do echo '[]' > "$OUT/$list.json"; done
@@ -270,20 +262,21 @@ runs:
           --argjson cve_crit "$CVE_CRIT" --argjson cve_high "$CVE_HIGH" --argjson cve_med "$CVE_MED" \
           '{
             unit_tests: { total: $unit_total, passed: $unit_passed, failed: $unit_failed },
-            integration_tests: { total: 0, passed: 0, failed: 0 },
             coverage: { line_percent: $cov_pct },
-            sast_scan: { vulnerabilities: { critical: $sast_crit, high: $sast_high, medium: $sast_med }, scanned_files: 0 },
+            sast_scan: { vulnerabilities: { critical: $sast_crit, high: $sast_high, medium: $sast_med } },
             security: { tool: "trivy", vulnerabilities: { critical: $cve_crit, high: $cve_high, medium: $cve_med } }
           }' > "$OUT/metrics.json"
 
         jq -n \
           --arg org "$ORG" --arg repo "${GITHUB_REPOSITORY#*/}" \
           --arg version "$VERSION" --arg env "$ENVIRONMENT" --arg pipeline "$PIPELINE" \
+          --arg run_id "${GITHUB_RUN_ID:-}" \
           --slurpfile metrics "$OUT/metrics.json" --slurpfile reports "$OUT/reports.json" \
           --slurpfile tests "$OUT/tests.json" --slurpfile cov "$OUT/coverage.json" \
           --slurpfile sast "$OUT/sast.json" --slurpfile cve "$OUT/cve.json" \
           '{
             org: $org, repo: $repo, version: $version, environment: $env, pipeline: $pipeline,
+            run_id: $run_id,
             metrics: $metrics[0], reports: $reports[0],
             test_report_files: $tests[0], coverage_files: $cov[0],
             sast_files: $sast[0], cve_files: $cve[0]
