@@ -51,7 +51,7 @@ jobs:
               [ -f "$f" ] && SUREFIRE_HTML="$f" && break
             done
             if [ -n "$SUREFIRE_HTML" ]; then
-              echo "<html><body><h1>Unit Tests (Gradle)</h1><iframe src='tests/test/index.html' style='width:100%;height:600px;border:none'></iframe></body></html>" > unit-tests.html
+              echo "<html><body><h1>Unit Tests (Gradle)</h1><p>Full Gradle report: build/reports/tests/test/index.html in this artifact.</p></body></html>" > unit-tests.html
             else
               FIRST_XML=$(find build/test-results -name 'TEST-*.xml' -print -quit 2>/dev/null || true)
               CONTENT=$([ -n "$FIRST_XML" ] && cat "$FIRST_XML" | head -100 || echo 'no test results')
@@ -81,7 +81,25 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/opengrep/opengrep/${OPENGREP_INSTALL_SHA}/install.sh" \
             | bash -s -- -v "$OPENGREP_VERSION" || true
           export PATH="$HOME/.opengrep/cli/latest:$PATH"
-          opengrep scan --config auto --exclude .github --sarif -o sast.sarif . 2>/dev/null || true
+          # Scan source only: generated reports and build output are not the customer's code.
+          opengrep scan --config auto --exclude .github --exclude coverage --exclude unit-tests.html \
+            --exclude integration-tests.html --exclude build --exclude .gradle \
+            --sarif -o sast.sarif . 2>/dev/null || true
+
+      # Trivy reads Gradle dependencies only from gradle.lockfile. Without a committed
+      # lockfile, resolve one for this run so the CVE scan covers the real dependency tree
+      # (root project; commit your own lockfiles for multi-project builds).
+      - name: Resolve Gradle lockfile for CVE scan
+        if: always()
+        run: |
+          if { [ -f build.gradle ] || [ -f build.gradle.kts ]; } && [ ! -f gradle.lockfile ]; then
+            GRADLE_CMD="gradle"
+            [ -f gradlew ] && chmod +x gradlew && GRADLE_CMD="./gradlew"
+            INIT="$RUNNER_TEMP/lanesync-dependency-locking.gradle"
+            echo 'allprojects { dependencyLocking { lockAllConfigurations() } }' > "$INIT"
+            $GRADLE_CMD --init-script "$INIT" dependencies --write-locks --no-daemon -q > /dev/null 2>&1 \
+              || echo "::warning::Could not resolve a Gradle lockfile — CVE scan will not cover Gradle dependencies"
+          fi
 
       - name: CVE scan (Trivy)
         if: always()
@@ -92,7 +110,9 @@ jobs:
           format: json
           output: trivy.json
           exit-code: '0'
-          severity: CRITICAL,HIGH
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          # Build output holds tool jars (JaCoCo agent, Gradle caches), not the app's dependencies.
+          skip-dirs: build,.gradle
 
       - name: Upload reports artifact
         if: always()
@@ -105,6 +125,7 @@ jobs:
             sast.sarif
             trivy.json
             build/test-results/
+            build/reports/tests/
             build/reports/jacoco/
             coverage/
           retention-days: 30
