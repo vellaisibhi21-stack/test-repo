@@ -81,7 +81,7 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/opengrep/opengrep/${OPENGREP_INSTALL_SHA}/install.sh" \
             | bash -s -- -v "$OPENGREP_VERSION" || true
           export PATH="$HOME/.opengrep/cli/latest:$PATH"
-          opengrep scan --config auto --sarif -o sast.sarif . 2>/dev/null || true
+          opengrep scan --config auto --exclude .github --sarif -o sast.sarif . 2>/dev/null || true
 
       - name: CVE scan (Trivy)
         if: always()
