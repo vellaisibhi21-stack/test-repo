@@ -195,10 +195,18 @@ runs:
 
         # ── SAST (SARIF) & CVE (Trivy JSON) ───────────────────────────────
         SAST_CRIT=0; SAST_HIGH=0; SAST_MED=0
+        SARIF="$OUT/sast.sarif"
         if [ -f sast.sarif ]; then
-          SAST_CRIT=$(int jq '[.runs[]?.results[]? | select(.level=="error")] | length' sast.sarif)
-          SAST_HIGH=$(int jq '[.runs[]?.results[]? | select(.level=="warning")] | length' sast.sarif)
-          SAST_MED=$(int jq '[.runs[]?.results[]? | select(.level=="note")] | length' sast.sarif)
+          # LaneSync never receives source code: drop every code excerpt SARIF can carry
+          # (snippets, context regions, embedded artifact contents, suggested-fix code).
+          # If the file cannot be sanitized it is not sent at all.
+          jq 'walk(if type == "object" then del(.snippet, .contextRegion, .contents, .artifactChanges) else . end)' \
+            sast.sarif > "$SARIF" 2>/dev/null || rm -f "$SARIF"
+        fi
+        if [ -f "$SARIF" ]; then
+          SAST_CRIT=$(int jq '[.runs[]?.results[]? | select(.level=="error")] | length' "$SARIF")
+          SAST_HIGH=$(int jq '[.runs[]?.results[]? | select(.level=="warning")] | length' "$SARIF")
+          SAST_MED=$(int jq '[.runs[]?.results[]? | select(.level=="note")] | length' "$SARIF")
         fi
 
         CVE_CRIT=0; CVE_HIGH=0; CVE_MED=0
@@ -212,7 +220,7 @@ runs:
         fi
 
         # ── HTML views for the current evidence UI ────────────────────────
-        if [ -f sast.sarif ]; then
+        if [ -f "$SARIF" ]; then
           jq -r '
             [.runs[]? as $r | $r.results[]? | {
               level: (.level // "warning"),
@@ -223,7 +231,7 @@ runs:
             | "<html><body><h1>SAST Scan (\($f | length) findings)</h1><table border=\"1\" cellpadding=\"4\">"
               + "<tr><th>Level</th><th>Rule</th><th>Location</th><th>Message</th></tr>"
               + ([$f[] | "<tr><td>\(.level | @html)</td><td>\(.rule | @html)</td><td>\(.loc | @html)</td><td>\(.msg | @html)</td></tr>"] | join(""))
-              + "</table></body></html>"' sast.sarif > "$OUT/sast.html" 2>/dev/null || rm -f "$OUT/sast.html"
+              + "</table></body></html>"' "$SARIF" > "$OUT/sast.html" 2>/dev/null || rm -f "$OUT/sast.html"
         fi
         if [ -f "$OUT/trivy.json" ]; then
           jq -r '
@@ -243,7 +251,8 @@ runs:
         }
         add_report unit_tests unit-tests.html
         add_report integration_tests integration-tests.html
-        add_report coverage coverage/index.html
+        # coverage/index.html is not sent: tool-generated coverage HTML embeds source files.
+        # LaneSync renders the coverage view from the parsed coverage report instead.
         add_report sast_scan "$OUT/sast.html"
         add_report security "$OUT/cve.html"
 
@@ -251,7 +260,7 @@ runs:
         for list in tests coverage sast cve; do echo '[]' > "$OUT/$list.json"; done
         for f in ${TEST_FILES[@]+"${TEST_FILES[@]}"}; do append_file "$OUT/tests.json" "$f"; done
         [ -n "$COV_FORMAT" ] && append_file "$OUT/coverage.json" "$COV_FILE" "$COV_FORMAT"
-        [ -f sast.sarif ] && append_file "$OUT/sast.json" sast.sarif sarif
+        [ -f "$SARIF" ] && append_file "$OUT/sast.json" "$SARIF" sarif
         [ -f "$OUT/trivy.json" ] && append_file "$OUT/cve.json" "$OUT/trivy.json" trivy
 
         jq -n \
@@ -281,7 +290,7 @@ runs:
           }' > "$OUT/payload.json"
         gzip -c "$OUT/payload.json" > "$OUT/payload.json.gz"
 
-        echo "Detected: tests=[${TEST_FILES[*]:-none}] coverage=${COV_FILE:-none}(${COV_FORMAT:-n/a}) sast=$([ -f sast.sarif ] && echo yes || echo no) cve=$([ -f trivy.json ] && echo yes || echo no)"
+        echo "Detected: tests=[${TEST_FILES[*]:-none}] coverage=${COV_FILE:-none}(${COV_FORMAT:-n/a}) sast=$([ -f "$SARIF" ] && echo yes || echo no) cve=$([ -f trivy.json ] && echo yes || echo no)"
         echo "Payload: $(wc -c < "$OUT/payload.json" | tr -d ' ') bytes ($(wc -c < "$OUT/payload.json.gz" | tr -d ' ') gzipped)"
 
         {
